@@ -3494,6 +3494,8 @@ std::condition_variable pipelineCreateCondition;
 bool blockLibraryCreate = false;
 bool libraryCreateEntered = false;
 bool releaseLibraryCreate = false;
+VkResult libraryCreateResult = VK_SUCCESS;
+bool blockFinalLink = false;
 
 template<typename THandle>
 THandle makeHandle() {
@@ -3680,10 +3682,11 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipeli
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
     {
         std::unique_lock lock(pipelineCreateMutex);
-        if (blockLibraryCreate) {
+        if (blockLibraryCreate && (!blockFinalLink || (infos[0].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) == 0)) {
             libraryCreateEntered = true;
             pipelineCreateCondition.notify_all();
             pipelineCreateCondition.wait(lock, [] { return releaseLibraryCreate; });
+            if (libraryCreateResult != VK_SUCCESS) return libraryCreateResult;
         }
     }
     Require(count == 1, "mock expects exactly one graphics pipeline per call");
@@ -5154,7 +5157,7 @@ void pipelineLibrarySetTests() {
     }
 }
 
-void pipelineLibraryClearWaitsForBuildTests() {
+void pipelineLibraryClearWaitsForBuild(bool failCreate, bool finalLink = false) {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
     auto context = mockContext();
@@ -5178,8 +5181,35 @@ void pipelineLibraryClearWaitsForBuildTests() {
         blockLibraryCreate = true;
         libraryCreateEntered = false;
         releaseLibraryCreate = false;
+        libraryCreateResult = failCreate ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
+        blockFinalLink = finalLink;
     }
-    std::thread build([&] { Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders), "graphics pipeline library prebuild was skipped"); });
+    std::exception_ptr buildFailure;
+    std::thread build([&] {
+        try {
+            if (finalLink) {
+                const auto states = PipelineLibraryDynamicStates();
+                VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+                dynamic.dynamicStateCount = static_cast<std::uint32_t>(states.size());
+                dynamic.pDynamicStates = states.data();
+                std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+                for (auto& stage : stages) stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+                stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+                VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+                info.pDynamicState = &dynamic;
+                info.stageCount = static_cast<std::uint32_t>(stages.size());
+                info.pStages = stages.data();
+                VkPipelineRenderingCreateInfoKHR rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+                VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                static_cast<void>(LinkPipelineFromLibraries(context, info, rendering, layout, {}));
+            } else {
+                Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders), "graphics pipeline library prebuild was skipped");
+            }
+        } catch (...) {
+            buildFailure = std::current_exception();
+        }
+    });
     {
         std::unique_lock lock(pipelineCreateMutex);
         pipelineCreateCondition.wait(lock, [] { return libraryCreateEntered; });
@@ -5198,9 +5228,30 @@ void pipelineLibraryClearWaitsForBuildTests() {
     pipelineCreateCondition.notify_all();
     build.join();
     clear.join();
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        blockLibraryCreate = false;
+        libraryCreateResult = VK_SUCCESS;
+    }
     Require(waited, "clearing pipeline libraries did not wait for an active part build");
     Require(cleared.load(std::memory_order_acquire), "clearing pipeline libraries did not complete after the part build");
     Require(mock.live == 0, "clearing during a library build leaked Vulkan objects");
+    if (failCreate) {
+        Require(buildFailure != nullptr, "a failed Vulkan library build was accepted");
+        try {
+            std::rethrow_exception(buildFailure);
+        } catch (const std::runtime_error& error) {
+            Require(std::string_view(error.what()).find(finalLink ? "vkCreateGraphicsPipelines link" : "vkCreateGraphicsPipelines library") != std::string_view::npos, "the library build failed for an unexpected reason");
+        }
+    } else if (buildFailure != nullptr) {
+        std::rethrow_exception(buildFailure);
+    }
+}
+
+void pipelineLibraryClearWaitsForBuildTests() {
+    pipelineLibraryClearWaitsForBuild(false);
+    pipelineLibraryClearWaitsForBuild(true);
+    pipelineLibraryClearWaitsForBuild(true, true);
 }
 
 void barycentricEmulationTests() {
