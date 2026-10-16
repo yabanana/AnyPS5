@@ -5188,21 +5188,7 @@ void pipelineLibraryClearWaitsForBuild(bool failCreate, bool finalLink = false) 
     std::thread build([&] {
         try {
             if (finalLink) {
-                const auto states = PipelineLibraryDynamicStates();
-                VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-                dynamic.dynamicStateCount = static_cast<std::uint32_t>(states.size());
-                dynamic.pDynamicStates = states.data();
-                std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
-                for (auto& stage : stages) stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-                stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-                VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-                info.pDynamicState = &dynamic;
-                info.stageCount = static_cast<std::uint32_t>(stages.size());
-                info.pStages = stages.data();
-                VkPipelineRenderingCreateInfoKHR rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
-                VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-                static_cast<void>(LinkPipelineFromLibraries(context, info, rendering, layout, {}));
+                const Pipeline pipeline(context, state, VertexInputLayout{}, resources, shaders);
             } else {
                 Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders), "graphics pipeline library prebuild was skipped");
             }
